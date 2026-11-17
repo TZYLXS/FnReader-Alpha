@@ -1,0 +1,599 @@
+package io.legado.app.service
+
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import io.legado.app.base.BaseService
+import io.legado.app.constant.AppConst
+import io.legado.app.constant.IntentAction
+import io.legado.app.constant.NotificationId
+import io.legado.app.model.FnReaderAutoSync
+import io.legado.app.model.FnReaderEbook
+import io.legado.app.model.FnReaderRemote
+import io.legado.app.ui.config.FnReaderConfigDialog
+import io.legado.app.utils.getPrefString
+import io.legado.app.utils.putPrefString
+import io.legado.app.utils.servicePendingIntent
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.asCoroutineDispatcher
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import splitties.init.appCtx
+import java.util.concurrent.Executors
+
+/**
+ * FnReader 手机解析桥常驻服务
+ *
+ * 开着的时候一直长轮询 `/api/m/remote/pending`：飞牛那边本机解析不了的书源
+ * （要 WebView / 加密接口）会把 search / toc / content 任务派过来，这里用本机书源规则
+ * 跑一遍，再把结果 POST 回 `/api/m/remote/result`。
+ */
+class FnReaderBridgeService : BaseService() {
+
+    companion object {
+        /**
+         * 任务上限跟服务端的等待时间对齐（FnReader 1.8.x：搜索/目录 20 秒、正文 25 秒
+         * 等不到就自己退回本机解析）。这里留一点余量后主动判超时，
+         * 免得飞牛那边早就放弃了，手机还在啃一个啃不动的源。
+         */
+        private const val JOB_TIMEOUT_SEARCH = 18000L
+        private const val JOB_TIMEOUT_TOC = 18000L
+        private const val JOB_TIMEOUT_CONTENT = 23000L
+        /**
+         * 简介补全（bookinfo）服务端只等 10 秒（见 docs/APP同步接口.md 18.2「超时 10 秒」），
+         * 手机这边必须比它早放手，否则飞牛早就按原样返回了，我们还在啃一个啃不动的详情页。
+         */
+        private const val JOB_TIMEOUT_BOOKINFO = 9000L
+        private const val JOB_TIMEOUT_DEFAULT = 20000L
+
+        /** 电子书解析可能要几分钟，但不能超过服务端的 10 分钟 TTL */
+        private const val EBOOK_TIMEOUT = 8 * 60 * 1000L
+
+        /** 按需补章：只解析不下载时几秒就出，留 60 秒给大书 + 网络 */
+        private const val EBOOK_CHAPTER_TIMEOUT = 60 * 1000L
+
+        /**
+         * 检索并发：Pro 面向 8 核 / 2 大核（A72 及以上）的高性能机型，按 CPU 核数自适应。
+         * 8 核及以上开 6 条解析线程，6 核 4 条，4 核 3 条，再低退回 2 条——
+         * 既要吃满性能，也不能把站点打到限流。
+         */
+        private val cpuCores: Int by lazy { Runtime.getRuntime().availableProcessors() }
+        private val searchConcurrency: Int by lazy {
+            when {
+                cpuCores >= 8 -> 6
+                cpuCores >= 6 -> 4
+                cpuCores >= 4 -> 3
+                else -> 2
+            }
+        }
+
+        /** 交互式 TOC 独立两条线程，批量搜索占满检索池时目录仍能响应 */
+        private val tocConcurrency: Int by lazy { 2 }
+
+        /** 封面 / 简介专用线程数：单独一条池，永远不跟检索任务抢线程 */
+        private val infoConcurrency: Int by lazy { if (cpuCores >= 8) 2 else 1 }
+
+        /** 书源同步 / 缓存上传的自动节拍：5 分钟一轮，连上就跑 */
+        private const val AUTO_SYNC_INTERVAL = 5 * 60 * 1000L
+
+        @Volatile
+        var isRun = false
+            private set
+
+        fun start(context: Context = appCtx) {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, FnReaderBridgeService::class.java)
+            )
+        }
+
+        fun stop(context: Context = appCtx) {
+            context.stopService(Intent(context, FnReaderBridgeService::class.java))
+        }
+
+        private fun timeoutOf(type: String): Long = when (type) {
+            "search" -> JOB_TIMEOUT_SEARCH
+            "toc" -> JOB_TIMEOUT_TOC
+            "content" -> JOB_TIMEOUT_CONTENT
+            "rank" -> JOB_TIMEOUT_CONTENT
+            "bookinfo" -> JOB_TIMEOUT_BOOKINFO
+            "ebook-parse" -> EBOOK_TIMEOUT
+            "ebook-chapter" -> EBOOK_CHAPTER_TIMEOUT
+            else -> JOB_TIMEOUT_DEFAULT
+        }
+    }
+
+    /** 软总线设备身份：领任务时一起报上去，网页「设置 → 软总线」里就能看到这台机器 */
+    private val deviceId: String by lazy { AppConst.androidId }
+    private val deviceName: String by lazy { Build.MODEL.ifEmpty { "Android 手机" } }
+    private val deviceModel: String by lazy {
+        val maker = Build.MANUFACTURER.orEmpty()
+        val model = Build.MODEL.orEmpty()
+        if (maker.isEmpty() || model.startsWith(maker, true)) model else "$maker $model"
+    }
+    private val appVersion: String by lazy { AppConst.appInfo.versionName }
+
+    private var loopJob: Job? = null
+
+    /** 一条待办：领回来的任务，连同它回来时用的连接上下文 */
+    private class QueuedJob(
+        val base: String,
+        val token: String,
+        val job: FnReaderRemote.Job,
+        val onlineText: String
+    )
+
+    /**
+     * 软总线上跑两条队列，互不挤占：
+     * - 检索队列（search / toc / content / rank）：并发 2，某个慢源卡住只堵这一条；
+     * - 简介队列（只装 bookinfo，补简介与封面）：单并发，永远不排在检索任务后面。
+     */
+    private val searchQueue = Channel<QueuedJob>(Channel.UNLIMITED)
+    private val tocQueue = Channel<QueuedJob>(Channel.UNLIMITED)
+    private val infoQueue = Channel<QueuedJob>(Channel.UNLIMITED)
+
+    /** 电子书解析单独一条队列：解析整本书很吃 CPU，不能挤掉搜索/正文任务 */
+    private val ebookQueue = Channel<QueuedJob>(Channel.UNLIMITED)
+
+    /**
+     * 三条真正的线程池（不是协程默认调度器）：
+     * - parse：检索/目录/正文/榜单并行解析，线程数按核数自适应；
+     * - info：封面与简介独占，检索再忙也不会把补简介排到最后；
+     * - ebook：整本解析独占一个线程，避免和其他解析抢 CPU。
+     */
+    private val parseDispatcher = Executors.newFixedThreadPool(
+        searchConcurrency
+    ) { r -> Thread(r, "fnreader-parse").apply { isDaemon = true } }.asCoroutineDispatcher()
+    private val tocDispatcher = Executors.newFixedThreadPool(
+        if (cpuCores >= 4) 2 else 1
+    ) { r -> Thread(r, "fnreader-toc").apply { isDaemon = true } }.asCoroutineDispatcher()
+    private val infoDispatcher = Executors.newFixedThreadPool(
+        infoConcurrency
+    ) { r -> Thread(r, "fnreader-info").apply { isDaemon = true } }.asCoroutineDispatcher()
+    private val ebookDispatcher = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "fnreader-ebook").apply { isDaemon = true }
+    }.asCoroutineDispatcher()
+
+    private var notificationContent = "手机解析待命：等待飞牛派任务"
+    private val notificationBuilder by lazy {
+        NotificationCompat.Builder(this, AppConst.channelIdDownload)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setOngoing(true)
+            .setContentTitle("FnReader 手机解析")
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "关闭",
+                servicePendingIntent<FnReaderBridgeService>(IntentAction.stop)
+            )
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        isRun = true
+        startLoop()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == IntentAction.stop) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        return START_STICKY
+    }
+
+    override fun upNotification() {
+        notificationBuilder.setContentText(notificationContent)
+        startForeground(NotificationId.FnReaderBridgeService, notificationBuilder.build())
+    }
+
+    override fun onDestroy() {
+        isRun = false
+        loopJob?.cancel()
+        loopJob = null
+        runCatching { parseDispatcher.close() }
+        runCatching { tocDispatcher.close() }
+        runCatching { infoDispatcher.close() }
+        runCatching { ebookDispatcher.close() }
+        super.onDestroy()
+    }
+
+    private fun startLoop() {
+        loopJob?.cancel()
+        loopJob = lifecycleScope.launch(Dispatchers.IO) {
+            var lastError = ""
+            var onlineText = ""
+            var lastInfoAt = 0L
+            var lastAutoSyncAt = 0L
+            // 服务端把本机判成调试设备时只提示一次，别每秒刷通知
+            var debugWarned = false
+            // 三条常驻工作者：检索按核数开 N 条真线程并行，简介/封面独占自己的线程，电子书独占一条
+            repeat(searchConcurrency) {
+                launch(parseDispatcher) {
+                    for (item in searchQueue) {
+                        runJob(item.base, item.token, item.job, item.onlineText)
+                    }
+                }
+            }
+            launch(tocDispatcher) {
+                for (item in tocQueue) {
+                    runJob(item.base, item.token, item.job, item.onlineText)
+                }
+            }
+            launch(infoDispatcher) {
+                for (item in infoQueue) {
+                    runJob(item.base, item.token, item.job, item.onlineText)
+                }
+            }
+            launch(ebookDispatcher) {
+                for (item in ebookQueue) {
+                    if (item.job.type == "ebook-chapter") {
+                        runEbookChapterJob(item)
+                    } else {
+                        runEbookJob(item)
+                    }
+                }
+            }
+            while (isActive) {
+                val base = FnReaderRemote.normalizeBase(
+                    getPrefString(FnReaderConfigDialog.KEY_SERVER, "").orEmpty()
+                )
+                val token = getPrefString(FnReaderConfigDialog.KEY_TOKEN, "").orEmpty()
+                if (base.isEmpty() || token.isEmpty()) {
+                    notificationContent = "还没填服务器地址或令牌，去「我的 → 接入 FnReader 服务器」里填"
+                    upNotification()
+                    delay(5000)
+                    continue
+                }
+                // 保活心跳：连上之后每 60 秒探一次 /api/m/info，
+                // 一来确认令牌没被重置、地址没变，二来让「在线」是持续状态而不是开局一次性。
+                if (System.currentTimeMillis() - lastInfoAt > 60_000L) {
+                    val heartbeat = runCatching { FnReaderRemote.info(base, token) }
+                    lastInfoAt = System.currentTimeMillis()
+                    if (heartbeat.isSuccess) {
+                        val version = heartbeat.getOrThrow()
+                        putPrefString(FnReaderConfigDialog.KEY_ONLINE, version)
+                        onlineText = "已连接 FnReader $version　待命中"
+                    } else {
+                        putPrefString(FnReaderConfigDialog.KEY_ONLINE, "")
+                        onlineText = "连不上服务器：${FnReaderRemote.describeError(heartbeat.exceptionOrNull()!!)}"
+                        notificationContent = "$onlineText（$base）"
+                        upNotification()
+                    }
+                }
+                // ⑧⑨ 不再让人手点：连上服务端后每 5 分钟自动跑一次书源同步 + 缓存上传；
+                // 服务端没这两个接口时各自跳过，不会一直报错。
+                if (System.currentTimeMillis() - lastAutoSyncAt > AUTO_SYNC_INTERVAL) {
+                    lastAutoSyncAt = System.currentTimeMillis()
+                    launch {
+                        val r = runCatching { FnReaderAutoSync.run(base, token) }.getOrNull()
+                        val summary = r?.summary().orEmpty()
+                        if (summary.isNotEmpty()) {
+                            notificationContent = summary
+                            upNotification()
+                        }
+                    }
+                }
+                val pending = try {
+                    FnReaderRemote.poll(
+                        base = base,
+                        token = token,
+                        waitMs = 15000,
+                        limit = 5,
+                        deviceId = deviceId,
+                        deviceName = deviceName,
+                        deviceModel = deviceModel,
+                        appVer = appVersion
+                    )
+                } catch (e: Exception) {
+                    val msg = FnReaderRemote.describeError(e)
+                    if (msg != lastError) {
+                        lastError = msg
+                        notificationContent = "连接失败：$msg（重试中）"
+                        upNotification()
+                    }
+                    delay(3000)
+                    continue
+                }
+                lastError = ""
+                // 2.6.12 起服务端会给 pending 带 debug 标记；命中调试规则的设备回传会被丢弃
+                if (pending.debug && !debugWarned) {
+                    debugWarned = true
+                    notificationContent = "本机被服务端识别为调试设备，回传会被忽略，请改设备 ID / 名称"
+                    upNotification()
+                }
+                val jobs = pending.jobs
+                if (jobs.isEmpty()) {
+                    notificationContent = onlineText.ifEmpty { "已连接　待命中" }
+                    upNotification()
+                }
+                // 任务按类型分进两条队列：bookinfo（简介/封面）走独立队列，
+                // 不和搜索抢并发；其余统一进检索队列，由 2 个工作者轮流跑。
+                for (job in jobs) {
+                    val item = QueuedJob(base, token, job, onlineText)
+                    when (job.type) {
+                        // media 类（bookinfo 及 2.6.17 拆分出的 cover/intro）统一走简介队列，
+                        // 不和检索任务抢线程
+                        "bookinfo", "cover", "intro" -> infoQueue.trySend(item)
+                        // 电子书解析：下载整本 → 本地解析 → 分片回传
+                        "ebook-parse" -> ebookQueue.trySend(item)
+                        // 目录先行（toc-only）之后，飞牛按需来要某一章
+                        "ebook-chapter" -> ebookQueue.trySend(item)
+                        "toc" -> tocQueue.trySend(item)
+                        else -> searchQueue.trySend(item)
+                    }
+                }
+                delay(1000)
+            }
+        }
+    }
+
+    /**
+     * 跑一个任务并回传。按任务类型定超时（搜索/目录 18 秒、正文/榜单 23 秒），
+     * 卡住的书源直接判超时，别让飞牛那边一直干等到超时。
+     */
+    private suspend fun runJob(
+        base: String,
+        token: String,
+        job: FnReaderRemote.Job,
+        onlineText: String
+    ) {
+        notificationContent = "正在解析：${job.type}"
+        upNotification()
+        val timeout = timeoutOf(job.type)
+        val timeoutMessage = "解析超时（${timeout / 1000} 秒没出结果），这个书源本机也跑不动"
+        val result = runCatching {
+            withTimeoutOrNull(timeout) { FnReaderRemote.execute(job) }
+                ?: throw FnReaderRemote.RemoteException(timeoutMessage)
+        }
+        val ok = result.isSuccess
+        val error = result.exceptionOrNull()?.let { FnReaderRemote.describeError(it) } ?: "解析失败"
+        runCatching {
+            FnReaderRemote.submit(
+                base = base,
+                token = token,
+                id = job.id,
+                ok = ok,
+                data = result.getOrNull(),
+                error = if (ok) null else error,
+                deviceId = deviceId
+            )
+        }
+        notificationContent = if (ok) {
+            val tag = job.payload.optString("key").ifEmpty {
+                job.payload.optString("bookUrl").ifEmpty { job.payload.optString("chapterUrl") }
+            }
+            "已回传 ${job.type} 结果（$tag）"
+        } else {
+            "解析失败：$error"
+        }
+        upNotification()
+        // 干完活回到「在线待命」
+        delay(1200)
+        notificationContent = onlineText.ifEmpty { "已连接　待命中" }
+        upNotification()
+    }
+
+    /**
+     * 电子书代理解析：下载整本 → 解析 EPUB/MOBI → 按约定的 JSON 分片上传 → 回结果。
+     * 失败时把错误码（drm / corrupt / unsupported / kf8-unsupported）原样带回，
+     * 服务端据此决定是本地兜底还是直接判失败。
+     */
+    private suspend fun runEbookJob(item: QueuedJob) {
+        val job = item.job
+        val payload = job.payload
+        val sha1 = payload.optString("sha1")
+        val format = payload.optString("format", "epub")
+        val name = payload.optString("name", sha1)
+        val expectedSize = payload.optLong("size", 0)
+        val fileUrl = payload.optString("fileUrl")
+        // 下载原文件用的是任务里单独下发的令牌，避免客户端配置里的令牌不匹配
+        val fileToken = payload.optString("token").ifEmpty { item.token }
+        // 目录先行：服务端在 payload 里带 tocOnly/mode=toc，客户端就只回 part0，
+        // 正文留给 ebook-chapter 任务按需补（见 fnreader-toc-only-server-spec-20261115.md）
+        val tocOnly = payload.optBoolean("tocOnly", false) ||
+            payload.optString("mode").equals("toc", true)
+
+        var ok = false
+        var data: JSONObject? = null
+        var error: String? = null
+        var file: java.io.File? = null
+
+        notificationContent = "正在下载电子书：$name"
+        upNotification()
+        try {
+            if (sha1.length != 40 || fileUrl.isEmpty()) {
+                throw FnReaderEbook.EbookException("unsupported", "任务缺少 sha1/fileUrl")
+            }
+            val result = withTimeoutOrNull(EBOOK_TIMEOUT) {
+                val dest = java.io.File(
+                    cacheDir,
+                    "ebook_bridge/${sha1}.${format.lowercase()}"
+                )
+                file = dest
+                FnReaderRemote.downloadToFile(item.base, fileToken, fileUrl, dest, expectedSize)
+                notificationContent = "已下载 ${name}，开始解析"
+                upNotification()
+
+                val parsed = FnReaderEbook.parse(dest, format, name)
+                var partCount = 1
+                if (tocOnly) {
+                    val part0 = FnReaderEbook.buildTocOnlyPart(parsed, sha1, format, name)
+                    FnReaderRemote.uploadEbookPart(
+                        base = item.base,
+                        token = fileToken,
+                        sha1 = sha1,
+                        seq = 0,
+                        total = 1,
+                        json = part0
+                    )
+                    notificationContent = "已回传目录：$name（${parsed.chapters.size} 章，正文按需）"
+                    upNotification()
+                } else {
+                    val parts = FnReaderEbook.buildParts(parsed, sha1, format, name)
+                    partCount = parts.size
+                    parts.forEachIndexed { seq, part ->
+                        FnReaderRemote.uploadEbookPart(
+                            base = item.base,
+                            token = fileToken,
+                            sha1 = sha1,
+                            seq = seq,
+                            total = parts.size,
+                            json = part
+                        )
+                        notificationContent = "回传分片 ${seq + 1}/${parts.size}：$name"
+                        upNotification()
+                    }
+                }
+                JSONObject().apply {
+                    put("chapters", parsed.chapters.size)
+                    put("parts", partCount)
+                    put("chars", parsed.chars)
+                    if (tocOnly) put("tocOnly", true)
+                }
+            } ?: throw FnReaderRemote.RemoteException("电子书解析超时（${EBOOK_TIMEOUT / 60000} 分钟）")
+
+            data = result
+            ok = true
+        } catch (e: Throwable) {
+            error = when (e) {
+                is FnReaderEbook.EbookException -> e.code
+                else -> FnReaderRemote.describeError(e)
+            }
+        } finally {
+            // 目录先行模式保留原文件：后面的 ebook-chapter 直接本地解析，不用再下一遍
+            if (!tocOnly) runCatching { file?.delete() }
+        }
+
+        runCatching {
+            FnReaderRemote.submit(
+                base = item.base,
+                token = item.token,
+                id = job.id,
+                ok = ok,
+                data = data,
+                error = error,
+                deviceId = deviceId
+            )
+        }
+        notificationContent = if (ok) {
+            "电子书已回传：$name（${data?.optInt("chapters") ?: 0} 章 / ${data?.optInt("parts") ?: 0} 片）"
+        } else {
+            "电子书解析失败：$error"
+        }
+        upNotification()
+        delay(1200)
+        notificationContent = item.onlineText.ifEmpty { "已连接　待命中" }
+        upNotification()
+    }
+
+    /**
+     * 目录先行之后的按需补章：`type=ebook-chapter`。
+     *
+     * payload：`{sha1, index}` 单章，或 `{sha1, indexes:[…]}` 多章；带 `format/name`，
+     * 本地没有缓存文件时还会带 `fileUrl/token/size` 让这边重新下一遍。
+     * 章节一律走 `POST /api/m/ebook/chapter?sha1=&index=` 推给飞牛，不占软总线结果。
+     */
+    private suspend fun runEbookChapterJob(item: QueuedJob) {
+        val job = item.job
+        val payload = job.payload
+        val sha1 = payload.optString("sha1")
+        val format = payload.optString("format", "epub").ifEmpty { "epub" }
+        val name = payload.optString("name", sha1)
+        val fileUrl = payload.optString("fileUrl")
+        val fileToken = payload.optString("token").ifEmpty { item.token }
+
+        val wanted = ArrayList<Int>()
+        payload.optJSONArray("indexes")?.let { arr ->
+            for (i in 0 until arr.length()) wanted.add(arr.optInt(i, -1))
+        }
+        if (wanted.isEmpty()) {
+            wanted.add(payload.optInt("index", payload.optInt("chapterIndex", -1)))
+        }
+
+        var ok = false
+        var data: JSONObject? = null
+        var error: String? = null
+
+        notificationContent = "电子书按需补章：$name"
+        upNotification()
+        try {
+            if (sha1.length != 40) {
+                throw FnReaderEbook.EbookException("unsupported", "任务缺少 sha1")
+            }
+            val dest = java.io.File(
+                cacheDir,
+                "ebook_bridge/${sha1}.${format.lowercase()}"
+            )
+            if (!dest.exists() || dest.length() == 0L) {
+                if (fileUrl.isEmpty()) {
+                    throw FnReaderEbook.EbookException("unsupported", "本地没有缓存文件，且任务没带 fileUrl")
+                }
+                notificationContent = "重新下载电子书：$name"
+                upNotification()
+                FnReaderRemote.downloadToFile(
+                    item.base, fileToken, fileUrl, dest, payload.optLong("size", 0)
+                )
+            }
+            val parsed = FnReaderEbook.parse(dest, format, name)
+            val valid = wanted.filter { it in parsed.chapters.indices }
+            if (valid.isEmpty()) {
+                throw FnReaderEbook.EbookException(
+                    "index",
+                    "章节号越界：$wanted / 本书共 ${parsed.chapters.size} 章"
+                )
+            }
+            withTimeoutOrNull(EBOOK_CHAPTER_TIMEOUT) {
+                valid.forEach { idx ->
+                    val json = FnReaderEbook.buildChapter(parsed, sha1, idx) ?: return@forEach
+                    FnReaderRemote.uploadEbookChapter(item.base, fileToken, sha1, idx, json)
+                    notificationContent = "已补章 ${idx + 1}/${parsed.chapters.size}：$name"
+                    upNotification()
+                }
+            } ?: throw FnReaderRemote.RemoteException(
+                "补章超时（${EBOOK_CHAPTER_TIMEOUT / 1000} 秒）"
+            )
+            data = JSONObject().apply {
+                put("chapters", valid.size)
+                put("indexes", org.json.JSONArray(valid))
+            }
+            ok = true
+        } catch (e: Throwable) {
+            error = when (e) {
+                is FnReaderEbook.EbookException -> e.code
+                else -> FnReaderRemote.describeError(e)
+            }
+        }
+
+        runCatching {
+            FnReaderRemote.submit(
+                base = item.base,
+                token = item.token,
+                id = job.id,
+                ok = ok,
+                data = data,
+                error = error,
+                deviceId = deviceId
+            )
+        }
+        notificationContent = if (ok) {
+            "已按需补章 ${data?.optInt("chapters") ?: 0} 章：$name"
+        } else {
+            "补章失败：$error"
+        }
+        upNotification()
+        delay(1200)
+        notificationContent = item.onlineText.ifEmpty { "已连接　待命中" }
+        upNotification()
+    }
+
+}
+

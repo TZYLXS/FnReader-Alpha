@@ -1,0 +1,60 @@
+name: build-debug-fpk
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'legado-web/**'
+      - 'tools/build-debug.sh'
+      - '.github/workflows/build-debug-fpk.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-debug-fpk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.13.1'
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install server dependencies
+        working-directory: legado-web/app/server
+        run: npm install --no-audit --no-fund
+
+      - name: Download fnpack
+        run: |
+          curl -fsSL -o fnpack https://static2.fnnas.com/fnpack/fnpack-1.2.3-linux-amd64
+          chmod +x fnpack
+          sudo mv fnpack /usr/local/bin/fnpack
+          fnpack --help | head -3
+
+      - name: Build debug FPK from source
+        run: |
+          set -euo pipefail
+          echo "FNREADER_NODE_HOME=$(dirname "$(dirname "$(command -v node)")")" >> "$GITHUB_ENV"
+          echo "FNREADER_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
+          echo "FNREADER_PYTHON=$(command -v python3.11 || command -v python)" >> "$GITHUB_ENV"
+          echo "FNREADER_PYTHON_STDLIB=${pythonLocation}/lib/python3.11" >> "$GITHUB_ENV"
+          bash tools/build-debug.sh
+
+      - name: Upload debug FPK
+        uses: actions/upload-artifact@v4
+        with:
+          name: legado-web-debug-0.1.0-fpk
+          path: dist/legado-web-debug-node26-java21.fpk
+          if-no-files-found: error

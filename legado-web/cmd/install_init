@@ -1,0 +1,3 @@
+#!/bin/bash
+# 安装前检查：Node/Java/Python 运行时已内置在 debug FPK，无外置应用依赖
+exit 0
